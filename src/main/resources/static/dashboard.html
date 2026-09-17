@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>SpatialHub | Operations Dashboard</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <style>
+        body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; display: flex; flex-direction: column; height: 100vh; }
+        #header { background: #0f172a; color: white; padding: 12px 24px; display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 12px; }
+        #controls { display: flex; align-items: center; gap: 10px; }
+        .ctrl-input { background: #1e293b; border: 1px solid #475569; color: white; padding: 6px 12px; border-radius: 6px; font-size: 13px; outline: none; }
+        .ctrl-input:focus { border-color: #38bdf8; }
+        #metrics { display: flex; gap: 12px; font-size: 13px; }
+        .metric-badge { background: #1e293b; padding: 6px 12px; border-radius: 6px; border: 1px solid #334155; }
+        .metric-badge b { color: #38bdf8; font-size: 14px; }
+        #map { flex: 1; width: 100%; }
+        .popup-card button { margin-top: 8px; width: 100%; padding: 6px; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; }
+        .btn-resolve { background: #10b981; color: white; }
+        .btn-ticket { background: #f59e0b; color: white; }
+        .btn-offline { background: #ef4444; color: white; }
+    </style>
+</head>
+<body>
+<div id="header">
+    <div style="font-weight: bold; font-size: 16px;">SpatialHub | GIS Network Operations</div>
+
+    <!-- Controls (Search & Filter) -->
+    <div id="controls">
+        <input type="text" id="tag-search" class="ctrl-input" placeholder="Search Asset Tag..." oninput="applyFilters()" />
+        <select id="status-filter" class="ctrl-input" onchange="applyFilters()">
+            <option value="ALL">All Statuses</option>
+            <option value="ACTIVE">Active Only</option>
+            <option value="DEGRADED">Degraded Only</option>
+            <option value="OFFLINE">Offline Only</option>
+        </select>
+    </div>
+
+    <!-- Telemetry -->
+    <div id="metrics">
+        <div class="metric-badge">Total: <b id="stat-total">0</b></div>
+        <div class="metric-badge">Active: <b id="stat-active" style="color: #4ade80;">0</b></div>
+        <div class="metric-badge">Degraded: <b id="stat-degraded" style="color: #fbbf24;">0</b></div>
+        <div class="metric-badge">Offline: <b id="stat-offline" style="color: #f87171;">0</b></div>
+        <div class="metric-badge">Open Tickets: <b id="stat-tickets">0</b></div>
+    </div>
+
+    <!-- User Profile & Logout -->
+    <div id="user-section" style="display: flex; align-items: center; gap: 8px;">
+        <span id="user-display" style="font-size: 12px; background: #0369a1; padding: 5px 10px; border-radius: 4px; color: white;">Operator</span>
+        <button id="logout-btn" onclick="logout()" style="background: #ef4444; color: white; border: none; padding: 6px 12px; border-radius: 4px; cursor: pointer; font-size: 12px; font-weight: bold;">Logout</button>
+    </div>
+</div>
+
+<div id="map"></div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+    // --- 1. Loop-Safe Session Guard ---
+    let currentUser = null;
+    try {
+        currentUser = JSON.parse(localStorage.getItem('minibiss_user'));
+    } catch (e) {
+        currentUser = null;
+    }
+
+    if (!currentUser) {
+        localStorage.removeItem('minibiss_user');
+        window.location.replace('/login.html');
+        // Stop execution to prevent Leaflet initialization on unauthorized redirects
+        throw new Error("Redirecting unauthenticated session to login.");
+    }
+
+    const userDisplay = document.getElementById('user-display');
+    if (userDisplay) {
+        userDisplay.innerText = `${currentUser.fullName} (${currentUser.role})`;
+    }
+
+    function logout() {
+        localStorage.removeItem('minibiss_user');
+        window.location.replace('/login.html');
+    }
+
+    // --- 2. Initialize Leaflet Map ---
+    const map = L.map('map').setView([9.9312, 76.2673], 14);
+
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        attribution: '© OpenStreetMap'
+    }).addTo(map);
+
+    let geojsonLayer;
+    let cableLayer = L.layerGroup().addTo(map);
+    let cachedRawData = null;
+
+    function loadStats() {
+        fetch('/api/v1/stats')
+            .then(res => res.json())
+            .then(data => {
+                document.getElementById('stat-total').innerText = data.totalAssets;
+                document.getElementById('stat-active').innerText = data.active;
+                document.getElementById('stat-degraded').innerText = data.degraded;
+                document.getElementById('stat-offline').innerText = data.offline;
+                document.getElementById('stat-tickets').innerText = data.openWorkOrders;
+            });
+    }
+
+    function getColor(status) {
+        if (status === 'ACTIVE') return '#10b981';
+        if (status === 'DEGRADED') return '#f59e0b';
+        return '#ef4444';
+    }
+
+    function loadMapData() {
+        fetch('/api/v1/assets/geojson')
+            .then(res => res.json())
+            .then(data => {
+                cachedRawData = data;
+                renderFilteredView(data);
+            });
+        loadStats();
+    }
+
+    function applyFilters() {
+        if (!cachedRawData) return;
+
+        const searchQuery = document.getElementById('tag-search').value.trim().toLowerCase();
+        const selectedStatus = document.getElementById('status-filter').value;
+
+        const filteredFeatures = cachedRawData.features.filter(feature => {
+            const matchesTag = feature.properties.tag.toLowerCase().includes(searchQuery);
+            const matchesStatus = (selectedStatus === 'ALL') || (feature.properties.status === selectedStatus);
+            return matchesTag && matchesStatus;
+        });
+
+        const filteredGeoJson = {
+            type: 'FeatureCollection',
+            features: filteredFeatures
+        };
+
+        renderFilteredView(filteredGeoJson);
+
+        if (searchQuery.length > 2 && filteredFeatures.length === 1) {
+            const coords = filteredFeatures[0].geometry.coordinates;
+            map.setView([coords[1], coords[0]], 16);
+        }
+    }
+
+    function renderFilteredView(data) {
+        if (geojsonLayer) map.removeLayer(geojsonLayer);
+        cableLayer.clearLayers();
+
+        geojsonLayer = L.geoJSON(data, {
+            pointToLayer: function (feature, latlng) {
+                return L.circleMarker(latlng, {
+                    radius: 10,
+                    fillColor: getColor(feature.properties.status),
+                    color: '#ffffff',
+                    weight: 2,
+                    fillOpacity: 0.9
+                });
+            },
+            onEachFeature: function (feature, layer) {
+                const p = feature.properties;
+                let actions = '';
+
+                if (p.status !== 'ACTIVE') {
+                    actions += `<button class="btn-resolve" onclick="resolveTicket(${p.id})">Mark Serviced (Back to Active)</button>`;
+                } else {
+                    actions += `<button class="btn-ticket" onclick="reportIssue(${p.id}, 'DEGRADED')">Report Degradation (Warning)</button>`;
+                    actions += `<button class="btn-offline" onclick="reportIssue(${p.id}, 'OFFLINE')">Cut / Power Outage (Offline)</button>`;
+                }
+
+                layer.bindPopup(`
+                    <div class="popup-card">
+                        <h4 style="margin: 0 0 6px 0;">${p.tag}</h4>
+                        <div><b>Type:</b> ${p.type}</div>
+                        <div><b>Status:</b> <span style="color: ${getColor(p.status)}; font-weight: bold;">${p.status}</span></div>
+                        <div><b>Region:</b> ${p.region}</div>
+                        ${actions}
+                    </div>
+                `);
+            }
+        }).addTo(map);
+
+        const features = data.features;
+        if (features && features.length >= 2) {
+            for (let i = 0; i < features.length - 1; i++) {
+                const fromCoords = features[i].geometry.coordinates;
+                const toCoords = features[i + 1].geometry.coordinates;
+
+                const fromLng = fromCoords[0];
+                const fromLat = fromCoords[1];
+                const toLng = toCoords[0];
+                const toLat = toCoords[1];
+
+                const fromTag = features[i].properties.tag;
+                const toTag = features[i + 1].properties.tag;
+
+                const routeUrl = `https://router.project-osrm.org/route/v1/driving/${fromLng},${fromLat};${toLng},${toLat}?geometries=geojson&overview=full`;
+
+                fetch(routeUrl)
+                    .then(res => res.json())
+                    .then(routeData => {
+                        if (routeData.routes && routeData.routes.length > 0) {
+                            const roadGeometry = routeData.routes[0].geometry;
+                            const streetPolyline = L.geoJSON(roadGeometry, {
+                                style: {
+                                    color: '#2563eb',
+                                    weight: 4,
+                                    opacity: 0.85,
+                                    dashArray: '6, 6'
+                                }
+                            });
+                            streetPolyline.bindPopup(`<b>Fiber Conduit Route</b><br>Connecting: ${fromTag} ➔ ${toTag}`);
+                            cableLayer.addLayer(streetPolyline);
+                        } else {
+                            drawFallbackLine(fromLat, fromLng, toLat, toLng, fromTag, toTag);
+                        }
+                    })
+                    .catch(() => {
+                        drawFallbackLine(fromLat, fromLng, toLat, toLng, fromTag, toTag);
+                    });
+            }
+        }
+    }
+
+    function drawFallbackLine(fromLat, fromLng, toLat, toLng, fromTag, toTag) {
+        const fallback = L.polyline([[fromLat, fromLng], [toLat, toLng]], {
+            color: '#2563eb',
+            weight: 3,
+            opacity: 0.6,
+            dashArray: '4, 4'
+        });
+        fallback.bindPopup(`<b>Direct Line</b><br>Connecting: ${fromTag} ➔ ${toTag}`);
+        cableLayer.addLayer(fallback);
+    }
+
+    map.on('click', function(e) {
+        const tag = prompt("Digital Survey: Enter Asset Tag (e.g., NODE-KOC-01):");
+        if (!tag) return;
+
+        const type = prompt("Select Type (OPTICAL_NODE, POLE, AMPLIFIER, FIBER_CABLE):", "OPTICAL_NODE");
+        if (!type) return;
+
+        const region = prompt("Enter Region Name:", "Kochi Central");
+        if (!region) return;
+
+        fetch('/api/v1/assets', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                assetTag: tag,
+                type: type,
+                latitude: e.latlng.lat,
+                longitude: e.latlng.lng,
+                region: region
+            })
+        }).then(() => loadMapData());
+    });
+
+    window.reportIssue = function(assetId, severity) {
+        const promptMsg = severity === 'OFFLINE'
+            ? "Enter critical outage reason (e.g., Fiber Cut, Pole Down):"
+            : "Enter degradation description (e.g., High Latency):";
+
+        const desc = prompt(promptMsg, severity === 'OFFLINE' ? "Total Cable Cut" : "Signal attenuation detected");
+        if (!desc) return;
+
+        fetch('/api/v1/work-orders', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                assetId: assetId,
+                title: severity === 'OFFLINE' ? "Critical Network Outage" : "Signal Degradation",
+                description: desc,
+                assignedTechnician: currentUser ? currentUser.fullName : "Field Tech",
+                targetStatus: severity
+            })
+        }).then(() => loadMapData());
+    };
+
+    window.resolveTicket = function(assetId) {
+        fetch('/api/v1/work-orders')
+            .then(res => res.json())
+            .then(orders => {
+                const match = orders.find(o => o.asset && o.asset.id === assetId && o.status !== 'COMPLETED');
+                if (match) {
+                    fetch(`/api/v1/work-orders/${match.id}/resolve`, { method: 'POST' })
+                        .then(() => loadMapData());
+                } else {
+                    alert("No open tickets found for this asset.");
+                }
+            });
+    };
+
+    loadMapData();
+</script>
+</body>
+</html>
